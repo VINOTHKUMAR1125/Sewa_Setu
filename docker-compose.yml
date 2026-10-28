@@ -4,37 +4,56 @@ services:
     environment:
       POSTGRES_DB: sewasetu
       POSTGRES_USER: sewasetu
-      POSTGRES_PASSWORD: sewasetu123
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./app/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
       - ./seed/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql
+    healthcheck:
+      # 127.0.0.1 (TCP): the temporary init server listens on the socket only,
+      # so this turns healthy only after the seed has finished loading.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U sewasetu -d sewasetu"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
+    restart: unless-stopped
 
   app:
     build: ./app
     ports:
       - "8000:8000"
+    env_file: .env
     depends_on:
-      - db
-      - smsgw
+      db:
+        condition: service_healthy
+      smsgw:
+        condition: service_started
     volumes:
       - uploads:/var/sewasetu/uploads
       - applogs:/var/log/sewasetu
+    restart: unless-stopped
 
   scheduler:
     build: ./app
-    command: ["cron", "-f"]
+    command: ["python", "scripts/scheduler.py"]
+    env_file: .env
     depends_on:
-      - db
+      db:
+        condition: service_healthy
+      smsgw:
+        condition: service_started
     volumes:
       - applogs:/var/log/sewasetu
+    restart: unless-stopped
 
   smsgw:
     build: ./smsgw
-    # internal only — reached by the app over the docker network and exposed to
+    # internal only - reached by the app over the docker network and exposed to
     # users via the app at /__gateway/ (so no second host port is needed)
     expose:
       - "8025"
+    restart: unless-stopped
 
 volumes:
   pgdata:

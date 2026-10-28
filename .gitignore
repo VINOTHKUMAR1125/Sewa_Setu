@@ -1,5 +1,6 @@
 .env
 __pycache__/
+*.pyc
 seed/seed.sql
 logs/
 dc-briefing.mp3

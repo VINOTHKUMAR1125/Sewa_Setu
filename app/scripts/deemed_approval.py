@@ -1,64 +1,69 @@
 # -*- coding: utf-8 -*-
 """
-Nightly deemed-approval job.
+Deemed-approval job.
 
 Under the Purvanchal Right to Public Services Act, an application not processed
 within the statutory SLA stands approved. This job marks such applications
 DEEMED_APPROVED and notifies the applicant by SMS.
 
-Scheduled via cron, 02:00 daily. See deploy/crontab.
+Run by scripts/scheduler.py every day at 02:00 IST. `--dry-run` only counts.
+(The old cron entry read a config/settings.ini that no longer exists after the
+March 2026 consolidation, so from then on it failed every night.)
 """
-
 import os
 import sys
-import configparser
-from datetime import datetime, timedelta
+import logging
+from datetime import timedelta
 
-import psycopg2
-import requests
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+import psycopg2  # noqa: E402
 
-config = configparser.ConfigParser()
-CONFIG_PATH = os.path.join(BASE_DIR, "config", "settings.ini")
-with open(CONFIG_PATH) as fh:
-    config.read_file(fh)
+from sewasetu.config import load_settings  # noqa: E402
+from sewasetu.sms import send_sms  # noqa: E402
+from sewasetu.timeutil import now_ist  # noqa: E402
 
-SLA_DAYS = config.getint("pension", "sla_days")
-SMS_GATEWAY_URL = config.get("app", "sms_gateway_url")
+log = logging.getLogger("deemed_approval")
 
 
-def main():
-    conn = psycopg2.connect(
-        host=config.get("database", "host"),
-        port=config.get("database", "port"),
-        dbname=config.get("database", "name"),
-        user=config.get("database", "user"),
-        password=config.get("database", "password"),
-    )
-    cur = conn.cursor()
-    cutoff = datetime.now() - timedelta(days=SLA_DAYS)
-    cur.execute(
-        """UPDATE applications
-           SET status = 'DEEMED_APPROVED', decided_at = %s, decided_by = 'RTPS-AUTO'
-           WHERE status = 'PENDING' AND submitted_at < %s
-           RETURNING application_no, mobile""",
-        (datetime.now(), cutoff))
-    rows = cur.fetchall()
-    conn.commit()
+def run(settings, dry_run=False, notify=send_sms):
+    conn = psycopg2.connect(host=settings.db_host, port=settings.db_port,
+                            dbname=settings.db_name, user=settings.db_user,
+                            password=settings.db_password)
+    try:
+        now = now_ist()
+        cutoff = now - timedelta(days=settings.sla_days)
+        cur = conn.cursor()
+        if dry_run:
+            cur.execute("SELECT count(*) FROM applications "
+                        "WHERE status = 'PENDING' AND submitted_at < %s", (cutoff,))
+            return cur.fetchone()[0], []
+        cur.execute("""UPDATE applications
+                       SET status = 'DEEMED_APPROVED', decided_at = %s,
+                           decided_by = 'RTPS-AUTO'
+                       WHERE status = 'PENDING' AND submitted_at < %s
+                       RETURNING application_no, mobile""", (now, cutoff))
+        rows = cur.fetchall()
+        conn.commit()
+        cur.close()
+    finally:
+        conn.close()
     for app_no, mobile in rows:
-        try:
-            requests.post(SMS_GATEWAY_URL + "/api/send", json={
-                "to": mobile,
-                "text": "Sewa Setu: your pension application %s stands approved "
-                        "under the RTPS Act." % app_no}, timeout=5)
-        except Exception:
-            pass
-    print("%s deemed approval: %d applications approved"
-          % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), len(rows)))
-    cur.close()
-    conn.close()
+        notify(settings.sms_gateway_url, mobile,
+               "Sewa Setu: your pension application %s stands approved under "
+               "the RTPS Act." % app_no)
+    return len(rows), rows
+
+
+def main(argv):
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    dry = "--dry-run" in argv
+    count, _ = run(load_settings(), dry_run=dry)
+    print("%s deemed approval%s: %d applications %s"
+          % (now_ist().strftime("%Y-%m-%d %H:%M:%S"), " (dry run)" if dry else "",
+             count, "would be approved" if dry else "approved"), flush=True)
+    return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))
